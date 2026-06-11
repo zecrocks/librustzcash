@@ -20,7 +20,7 @@ use zcash_client_backend::{
         AccountPurpose, AccountSource, SAPLING_SHARD_HEIGHT, TransactionStatus,
         WalletCommitmentTrees as _, Zip32Derivation,
         chain::ChainState,
-        error::RewindError,
+        error::{RewindError, TruncationError},
         scanning::{ScanPriority, ScanRange},
     },
     keys::{UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedSpendingKey},
@@ -961,27 +961,40 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
     /// block, this function does nothing.
     ///
     /// This should only be executed inside a transactional context.
-    fn truncate_to_height(&mut self, max_height: BlockHeight) -> Result<BlockHeight, Self::Error> {
+    fn truncate_to_height(
+        &mut self,
+        max_height: BlockHeight,
+    ) -> Result<BlockHeight, TruncationError<Self::Error>> {
         let truncation_height = {
             // This is the intersection of all the checkpoint heights from the sapling and orchard tree.
             let mut checkpoint_heights = BTreeSet::new();
-            self.sapling_tree.store().for_each_checkpoint(
-                self.sapling_tree.store().checkpoint_count()?,
-                |height, _| {
-                    checkpoint_heights.insert(u32::from(*height));
-                    Ok(())
-                },
-            )?;
+            self.sapling_tree
+                .store()
+                .checkpoint_count()
+                .and_then(|count| {
+                    self.sapling_tree
+                        .store()
+                        .for_each_checkpoint(count, |height, _| {
+                            checkpoint_heights.insert(u32::from(*height));
+                            Ok(())
+                        })
+                })
+                .map_err(|e| TruncationError::DataSource(e.into()))?;
             #[cfg(feature = "orchard")]
             {
                 let mut orchard_checkpoint_heights = BTreeSet::new();
-                self.orchard_tree.store().for_each_checkpoint(
-                    self.orchard_tree.store().checkpoint_count()?,
-                    |height, _| {
-                        orchard_checkpoint_heights.insert(u32::from(*height));
-                        Ok(())
-                    },
-                )?;
+                self.orchard_tree
+                    .store()
+                    .checkpoint_count()
+                    .and_then(|count| {
+                        self.orchard_tree
+                            .store()
+                            .for_each_checkpoint(count, |height, _| {
+                                orchard_checkpoint_heights.insert(u32::from(*height));
+                                Ok(())
+                            })
+                    })
+                    .map_err(|e| TruncationError::DataSource(e.into()))?;
 
                 checkpoint_heights = checkpoint_heights
                     .intersection(&orchard_checkpoint_heights)
@@ -989,16 +1002,15 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
                     .collect();
             }
             // All the checkpoints that are greater than the truncation height
-            let over = checkpoint_heights.split_off(&(u32::from(max_height + 1)));
+            checkpoint_heights.split_off(&(u32::from(max_height + 1)));
             if let Some(height) = checkpoint_heights.last().copied() {
                 Ok(BlockHeight::from(height))
             } else {
                 // If there are no checkpoints that are less than or equal to the truncation height
                 // then we can't truncate the tree.
-                Err(Error::RequestedRewindInvalid(
-                    over.first().copied().map(Into::into),
-                    max_height,
-                ))
+                Err(TruncationError::HeightUnavailable {
+                    requested: max_height,
+                })
             }
         }?;
 
@@ -1049,11 +1061,13 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
         if truncation_height < last_scanned_height {
             self.with_sapling_tree_mut(|tree| {
                 tree.truncate_to_checkpoint(&truncation_height).map(|_| ())
-            })?;
+            })
+            .map_err(|e| TruncationError::DataSource(e.into()))?;
             #[cfg(feature = "orchard")]
             self.with_orchard_tree_mut(|tree| {
                 tree.truncate_to_checkpoint(&truncation_height).map(|_| ())
-            })?;
+            })
+            .map_err(|e| TruncationError::DataSource(e.into()))?;
 
             // Do not delete sent notes; this can contain data that is not recoverable
             // from the chain. Wallets must continue to operate correctly in the

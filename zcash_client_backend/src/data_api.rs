@@ -96,7 +96,7 @@ use self::{
 };
 use crate::{
     data_api::{
-        error::RewindError,
+        error::{RewindError, TruncationError},
         wallet::{ConfirmationsPolicy, TargetHeight},
     },
     decrypt::DecryptedOutput,
@@ -3158,7 +3158,18 @@ pub trait WalletWrite: WalletRead {
     /// There may be restrictions on heights to which it is possible to truncate. Specifically, it
     /// will only be possible to truncate to heights at which is is possible to create a witness
     /// given the current state of the wallet's note commitment tree.
-    fn truncate_to_height(&mut self, max_height: BlockHeight) -> Result<BlockHeight, Self::Error>;
+    ///
+    /// If no height at or below `max_height` exists to which the data store is able to truncate
+    /// (for example, because the note commitment tree retains no checkpoint at or below that
+    /// height), implementations must return [`TruncationError::HeightUnavailable`] rather than a
+    /// backend-specific error, so that callers can implement reorg recovery — such as retrying
+    /// the truncation at a shallower height — without reference to a concrete backend error
+    /// type. See the documentation of [`TruncationError::HeightUnavailable`] for the recovery
+    /// protocol that callers are expected to implement.
+    fn truncate_to_height(
+        &mut self,
+        max_height: BlockHeight,
+    ) -> Result<BlockHeight, TruncationError<Self::Error>>;
 
     /// Truncates the wallet database to the specified chain state.
     ///

@@ -164,6 +164,54 @@ impl<AccountId: Hash + Eq + Debug, E: error::Error + 'static> error::Error
     }
 }
 
+/// Errors that may occur when truncating the wallet database to a maximum height.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TruncationError<E> {
+    /// An error occurred in the underlying data source.
+    DataSource(E),
+    /// No height exists at or below the requested height to which the data store is able
+    /// to truncate.
+    ///
+    /// [`WalletWrite::truncate_to_height`] implementations are required to truncate to the
+    /// nearest valid height at or below the request, so this error means that no valid
+    /// truncation target exists in that range at all (for example, because a chain
+    /// reorganization occurred close to the wallet birthday, below the lowest retained
+    /// note commitment tree checkpoint). Deliberately, no alternative "safe" height is
+    /// reported: any backend-supplied candidate would necessarily lie *above* the request,
+    /// and is not itself guaranteed to be a valid truncation target. Callers implementing
+    /// reorg recovery should instead retry at a shallower height of their choosing; the
+    /// only requirement for making progress is that the retried height is low enough to
+    /// remove the stored block that contradicts the new chain (i.e., strictly below the
+    /// height at which the chain continuity error was detected).
+    ///
+    /// [`WalletWrite::truncate_to_height`]: crate::data_api::WalletWrite::truncate_to_height
+    HeightUnavailable {
+        /// The block height that was requested as the truncation target.
+        requested: BlockHeight,
+    },
+}
+
+impl<E: Display> Display for TruncationError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TruncationError::DataSource(e) => write!(f, "Wallet data source error: {e}"),
+            TruncationError::HeightUnavailable { requested } => write!(
+                f,
+                "The wallet database cannot be truncated to any height at or below the requested height {requested}"
+            ),
+        }
+    }
+}
+
+impl<E: error::Error + 'static> error::Error for TruncationError<E> {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            TruncationError::DataSource(e) => Some(e),
+            TruncationError::HeightUnavailable { .. } => None,
+        }
+    }
+}
+
 /// Errors that can occur while working with PCZTs.
 #[cfg(feature = "pczt")]
 #[derive(Debug)]

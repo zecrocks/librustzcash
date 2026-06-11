@@ -62,7 +62,11 @@ use super::{
     },
 };
 use crate::{
-    data_api::{MaxSpendMode, TargetValue, error::RewindError, wallet::TargetHeight},
+    data_api::{
+        MaxSpendMode, TargetValue,
+        error::{RewindError, TruncationError},
+        wallet::TargetHeight,
+    },
     fees::{
         ChangeStrategy, DustOutputPolicy, StandardFeeRule,
         standard::{self, SingleOutputChangeStrategy},
@@ -3030,8 +3034,8 @@ impl WalletWrite for MockWalletDb {
     fn truncate_to_height(
         &mut self,
         _block_height: BlockHeight,
-    ) -> Result<BlockHeight, Self::Error> {
-        Err(())
+    ) -> Result<BlockHeight, TruncationError<Self::Error>> {
+        Err(TruncationError::DataSource(()))
     }
 
     fn truncate_to_chain_state(&mut self, _chain_state: ChainState) -> Result<(), Self::Error> {

@@ -18,6 +18,7 @@ use {
                 BlockCache, ChainState, CommitmentTreeRoot, error::Error as ChainError,
                 scan_cached_blocks,
             },
+            error::TruncationError,
             scanning::{ScanPriority, ScanRange},
         },
         proto::service::{self, BlockId, compact_tx_streamer_client::CompactTxStreamerClient},
@@ -416,17 +417,50 @@ where
             // height at which the error occurred, but may be an earlier height determined
             // based on heuristics such as the platform, available bandwidth, size of
             // recent CompactBlocks, etc.
-            let rewind_height = err.at_height().saturating_sub(10);
+            let requested = err.at_height().saturating_sub(10);
             info!(
                 "Chain reorg detected at {}, rewinding to {}",
                 err.at_height(),
-                rewind_height,
+                requested,
             );
 
-            // Rewind to the chosen height.
-            db_data
-                .truncate_to_height(rewind_height)
-                .map_err(Error::Wallet)?;
+            // Rewind to the chosen height. The wallet may rewind to a lower height than
+            // requested if no valid truncation target exists at the requested height; the
+            // returned height is the height to which the wallet data was truncated.
+            let rewind_height = match db_data.truncate_to_height(requested) {
+                Ok(h) => h,
+                Err(TruncationError::HeightUnavailable { .. }) => {
+                    // No valid truncation target exists at or below the requested height.
+                    // This occurs when the reorg is detected close to the wallet birthday,
+                    // where the heuristic rewind target can fall below every retained note
+                    // commitment tree checkpoint. Retry at the shallowest useful height:
+                    // the stored block at `err.at_height() - 1` contradicts the new chain,
+                    // so any effective rewind must remove it, and bounding the retry
+                    // strictly below it guarantees that repeated reorg recovery makes
+                    // progress instead of re-truncating to the same stale block forever.
+                    let bound = err.at_height().saturating_sub(2);
+                    match db_data.truncate_to_height(bound) {
+                        Ok(h) => {
+                            info!(
+                                "Shallow rewind to {} (no valid truncation target at or below {})",
+                                h, requested,
+                            );
+                            h
+                        }
+                        // Nothing below the conflicting block can be rewound to: the reorg
+                        // is deeper than the wallet's rewindable history, and the wallet
+                        // must be recovered by rescanning from its birthday.
+                        Err(TruncationError::HeightUnavailable { requested }) => {
+                            return Err(Error::RewindUnrecoverable {
+                                at_height: err.at_height(),
+                                requested,
+                            });
+                        }
+                        Err(TruncationError::DataSource(e)) => return Err(Error::Wallet(e)),
+                    }
+                }
+                Err(TruncationError::DataSource(e)) => return Err(Error::Wallet(e)),
+            };
 
             // Delete cached blocks from rewind_height onwards.
             //
@@ -570,6 +604,16 @@ pub enum Error<CaErr, DbErr, TrErr> {
     Wallet(DbErr),
     /// An error while interacting with a wallet database via [`WalletCommitmentTrees`].
     WalletTrees(ShardTreeError<TrErr>),
+    /// A chain reorganization was detected, but the wallet database could not be truncated to
+    /// any height below the height at which the reorg was detected: the reorg is deeper than
+    /// the wallet's rewindable history. The wallet must be recovered by rescanning from its
+    /// birthday height (e.g. by re-creating it from its seed phrase).
+    RewindUnrecoverable {
+        /// The height at which the chain continuity error was detected.
+        at_height: BlockHeight,
+        /// The truncation target that was most recently requested and found unavailable.
+        requested: BlockHeight,
+    },
 }
 
 #[cfg(feature = "sync")]
@@ -591,6 +635,15 @@ where
             Error::WalletTrees(e) => write!(
                 f,
                 "Error while interacting with wallet commitment trees: {e}"
+            ),
+            Error::RewindUnrecoverable {
+                at_height,
+                requested,
+            } => write!(
+                f,
+                "Unrecoverable chain reorganization at height {at_height}: the wallet database \
+                 cannot be truncated to any height at or below {requested}; the wallet must be \
+                 recovered by rescanning from its birthday height"
             ),
         }
     }

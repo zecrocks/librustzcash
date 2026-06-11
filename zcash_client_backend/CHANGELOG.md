@@ -12,6 +12,8 @@ workspace.
 
 ### Added
 - `zcash_client_backend::data_api::error::RewindError`
+- `zcash_client_backend::data_api::error::TruncationError`
+- `zcash_client_backend::sync::Error::RewindUnrecoverable`
 - `zcash_client_backend::wallet::WalletTransparentOutput`:
   - `recipient_account`
   - `recipient_key_scope`
@@ -54,6 +56,21 @@ workspace.
   and accessor have been renamed to `funding_account`, to disambiguate from
   the recipient-account terminology now used by `WalletTransparentOutput`.
 - `zcash_client_backend::data_api::WalletWrite`:
+  - `truncate_to_height` now returns `Result<BlockHeight,
+    TruncationError<Self::Error>>`. When no height exists at or below the
+    requested height to which the data store is able to truncate,
+    implementations are now required to report this via the backend-agnostic
+    `TruncationError::HeightUnavailable` variant instead of a
+    backend-specific error type. This makes it possible to write reorg
+    recovery logic (in particular, retrying truncation at a shallower
+    height when a reorg is detected close to the wallet birthday) that is
+    portable across `WalletWrite` implementations. Note that
+    `TruncationError::HeightUnavailable` deliberately does not report an
+    alternative "safe" rewind height: any such height would necessarily lie
+    above the requested height and is not itself guaranteed to be a valid
+    truncation target (the `safe_rewind_height` previously reported by
+    `zcash_client_sqlite` could name a height for which no scanned block
+    data exists, such as the wallet birthday anchor).
   - `rewind_to_height` has been replaced by `rewind_to_chain_state`. Callers
     that previously passed a `BlockHeight` should now construct a
     `ChainState` for the rewind target. The new method returns `Result<(),
@@ -84,6 +101,24 @@ workspace.
 ### Removed
 - `zcash_client_backend::data_api::WalletUtxo` (use `WalletTransparentOutput`
   instead).
+
+### Fixed
+- `zcash_client_backend::sync::run` no longer wedges young wallets on chain
+  reorgs near the wallet birthday. Previously, when the heuristic rewind
+  target (10 blocks below the detected continuity error) fell below every
+  retained note commitment tree checkpoint, `truncate_to_height` would fail,
+  the error would propagate out of `run`, and the same scan range would fail
+  identically on every subsequent attempt. The reorg recovery path now
+  retries the truncation at the shallowest useful height (immediately below
+  the stored block that contradicts the new chain) when the data store
+  reports `TruncationError::HeightUnavailable`, and returns the new
+  `sync::Error::RewindUnrecoverable` only when no valid truncation target
+  exists below the conflict at all (in which case the wallet must be
+  recovered by rescanning from its birthday).
+- `zcash_client_backend::sync::run` now truncates the block cache to the
+  height to which the wallet data store was actually truncated (which may be
+  lower than the requested rewind height), rather than to the requested
+  height.
 
 ## [0.23.0] - 2026-06-02
 

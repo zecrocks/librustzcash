@@ -81,6 +81,17 @@ pub enum SqliteClientError {
     /// A requested rewind would violate invariants of the storage layer. The payload returned with
     /// this error is (safe rewind height, requested height). If no safe rewind height can be
     /// determined, the safe rewind height member will be `None`.
+    ///
+    /// At the [`WalletWrite::truncate_to_height`] boundary, this error is converted to the
+    /// backend-agnostic [`TruncationError::HeightUnavailable`], which deliberately does not
+    /// expose `safe_rewind_height`: that value is computed as the minimum retained note
+    /// commitment tree checkpoint height *above* the request, without requiring that scanned
+    /// block data exists at that height, so it is not itself guaranteed to be a valid
+    /// truncation target (e.g. it may name the wallet birthday anchor, for which no block
+    /// data is stored).
+    ///
+    /// [`WalletWrite::truncate_to_height`]: zcash_client_backend::data_api::WalletWrite::truncate_to_height
+    /// [`TruncationError::HeightUnavailable`]: zcash_client_backend::data_api::error::TruncationError::HeightUnavailable
     RequestedRewindInvalid {
         /// The height to which it is possible to safely rewind, or `None` if no safe
         /// rewind height could be determined.

@@ -62,7 +62,7 @@ use zcash_client_backend::{
         SeedRelevance, SentTransaction, TargetValue, TransactionDataRequest, WalletCommitmentTrees,
         WalletRead, WalletSummary, WalletWrite, Zip32Derivation,
         chain::{BlockSource, ChainState, CommitmentTreeRoot},
-        error::{FindAccountForAddressError, RewindError},
+        error::{FindAccountForAddressError, RewindError, TruncationError},
         ll::{
             self, LowLevelWalletRead, LowLevelWalletWrite, ReceivedSaplingOutput,
             wallet::store_decrypted_tx,
@@ -1198,6 +1198,24 @@ impl<C: Borrow<rusqlite::Connection>, P: consensus::Parameters, CL, R> WalletTes
     }
 }
 
+/// Converts an error returned by [`wallet::truncate_to_height`] to the backend-agnostic
+/// error type required at the [`WalletWrite::truncate_to_height`] boundary.
+///
+/// The `safe_rewind_height` payload of [`SqliteClientError::RequestedRewindInvalid`] is
+/// deliberately not exposed: it is not itself guaranteed to be a valid truncation target
+/// (it may name a height, such as the wallet birthday anchor, for which no scanned block
+/// data exists).
+fn to_truncation_error(e: SqliteClientError) -> TruncationError<SqliteClientError> {
+    match e {
+        SqliteClientError::RequestedRewindInvalid {
+            requested_height, ..
+        } => TruncationError::HeightUnavailable {
+            requested: requested_height,
+        },
+        other => TruncationError::DataSource(other),
+    }
+}
+
 impl<C: BorrowMut<rusqlite::Connection>, P: consensus::Parameters, CL: Clock, R: RngCore>
     WalletWrite for WalletDb<C, P, CL, R>
 {
@@ -1324,8 +1342,26 @@ impl<C: BorrowMut<rusqlite::Connection>, P: consensus::Parameters, CL: Clock, R:
         self.transactionally(|wdb| wdb.store_transactions_to_be_sent(transactions))
     }
 
-    fn truncate_to_height(&mut self, max_height: BlockHeight) -> Result<BlockHeight, Self::Error> {
-        self.transactionally(|wdb| wdb.truncate_to_height(max_height))
+    fn truncate_to_height(
+        &mut self,
+        max_height: BlockHeight,
+    ) -> Result<BlockHeight, TruncationError<Self::Error>> {
+        let tx = self
+            .conn
+            .borrow_mut()
+            .transaction()
+            .map_err(|e| TruncationError::DataSource(SqliteClientError::from(e)))?;
+        let truncation_height = wallet::truncate_to_height(
+            &tx,
+            &self.params,
+            #[cfg(feature = "transparent-inputs")]
+            &self.gap_limits,
+            max_height,
+        )
+        .map_err(to_truncation_error)?;
+        tx.commit()
+            .map_err(|e| TruncationError::DataSource(SqliteClientError::from(e)))?;
+        Ok(truncation_height)
     }
 
     fn truncate_to_chain_state(&mut self, chain_state: ChainState) -> Result<(), Self::Error> {
@@ -1685,7 +1721,10 @@ impl<P: consensus::Parameters, CL: Clock, R: RngCore> WalletWrite
         Ok(())
     }
 
-    fn truncate_to_height(&mut self, max_height: BlockHeight) -> Result<BlockHeight, Self::Error> {
+    fn truncate_to_height(
+        &mut self,
+        max_height: BlockHeight,
+    ) -> Result<BlockHeight, TruncationError<Self::Error>> {
         wallet::truncate_to_height(
             self.conn.0,
             &self.params,
@@ -1693,6 +1732,7 @@ impl<P: consensus::Parameters, CL: Clock, R: RngCore> WalletWrite
             &self.gap_limits,
             max_height,
         )
+        .map_err(to_truncation_error)
     }
 
     fn truncate_to_chain_state(&mut self, chain_state: ChainState) -> Result<(), Self::Error> {

@@ -37,7 +37,7 @@ use crate::{
         MaxSpendMode, NoteFilter, Ratio, TargetValue, WalletCommitmentTrees, WalletRead,
         WalletSummary, WalletTest, WalletWrite,
         chain::{self, ChainState, CommitmentTreeRoot, ScanSummary},
-        error::Error,
+        error::{Error, TruncationError},
         testing::{
             AddressType, CacheInsertionResult, FakeCompactOutput, InitialChainState, TestBuilder,
             single_output_change_strategy,
@@ -4523,11 +4523,16 @@ where
     );
 
     // Step 5: Verify that truncate_to_height fails at capture_height because the
-    // checkpoint has been pruned.
+    // checkpoint has been pruned. The failure must be reported via the backend-agnostic
+    // `TruncationError::HeightUnavailable` variant so that callers can implement reorg
+    // recovery without matching on a concrete backend error type.
     let truncation_result = st.wallet_mut().truncate_to_height(capture_height);
     assert!(
-        truncation_result.is_err(),
-        "truncate_to_height should fail when checkpoint has been pruned"
+        matches!(
+            truncation_result,
+            Err(TruncationError::HeightUnavailable { requested }) if requested == capture_height
+        ),
+        "truncate_to_height should fail with HeightUnavailable when the checkpoint has been pruned"
     );
 
     // Step 6: truncate_to_chain_state should succeed because it inserts the frontier

@@ -8,6 +8,18 @@ indicated by the `PLANNED` status in order to make it possible to correctly
 represent the transitive `semver` implications of changes within the enclosing
 workspace.
 
+## [0.22.0] - PLANNED
+
+### Changed
+- `WalletWrite::truncate_to_height` (for both `WalletDb<C, ...>` and
+  `WalletDb<SqlTransaction<'_>, ...>`) now returns `Result<BlockHeight,
+  TruncationError<SqliteClientError>>`, per the trait change in
+  `zcash_client_backend 0.24`. `SqliteClientError::RequestedRewindInvalid` is
+  converted to `TruncationError::HeightUnavailable` at this boundary; the
+  `safe_rewind_height` payload is not exposed there because it is not itself
+  guaranteed to be a valid truncation target (it may name a height, such as
+  the wallet birthday anchor, for which no scanned block data exists).
+
 ## [0.21.0] - 2026-06-02
 
 ### Changed

@@ -20,6 +20,7 @@
 //!             scan_cached_blocks,
 //!             testing as chain_testing,
 //!         },
+//!         error::TruncationError,
 //!         scanning::ScanPriority,
 //!         testing,
 //!     },
@@ -92,8 +93,31 @@
 //!                     // size of recent CompactBlocks, etc.
 //!                     let rewind_height = err.at_height().saturating_sub(10);
 //!
-//!                     // Rewind to the chosen height.
-//!                     wallet_db.truncate_to_height(rewind_height).map_err(Error::Wallet)?;
+//!                     // Rewind to the chosen height. The returned height is the height to
+//!                     // which the wallet data was actually truncated, which may be lower
+//!                     // than requested.
+//!                     let rewind_height = match wallet_db.truncate_to_height(rewind_height) {
+//!                         Ok(h) => h,
+//!                         Err(TruncationError::HeightUnavailable { .. }) => {
+//!                             // No valid truncation target exists at or below the chosen
+//!                             // height (e.g. the reorg occurred close to the wallet
+//!                             // birthday). Retry at the shallowest useful height: the
+//!                             // stored block at `err.at_height() - 1` contradicts the new
+//!                             // chain, so it must be removed for recovery to progress.
+//!                             wallet_db
+//!                                 .truncate_to_height(err.at_height().saturating_sub(2))
+//!                                 .map_err(|e| match e {
+//!                                     TruncationError::DataSource(e) => Error::Wallet(e),
+//!                                     TruncationError::HeightUnavailable { .. } => {
+//!                                         // The reorg is deeper than the wallet's rewindable
+//!                                         // history; the wallet must be recovered by
+//!                                         // rescanning from its birthday height.
+//!                                         unimplemented!()
+//!                                     }
+//!                                 })?
+//!                         }
+//!                         Err(TruncationError::DataSource(e)) => return Err(Error::Wallet(e)),
+//!                     };
 //!
 //!                     // Delete cached blocks from rewind_height onwards.
 //!                     //

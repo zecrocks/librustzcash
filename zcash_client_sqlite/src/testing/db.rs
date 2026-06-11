@@ -20,7 +20,7 @@ use zcash_client_backend::{
     data_api::{
         TargetValue,
         chain::{ChainState, CommitmentTreeRoot},
-        error::RewindError,
+        error::{RewindError, TruncationError},
         scanning::ScanRange,
         testing::{DataStoreFactory, Reset, TestState},
         wallet::{ConfirmationsPolicy, TargetHeight},
