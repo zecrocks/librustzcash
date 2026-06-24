@@ -1279,6 +1279,18 @@ impl<C: BorrowMut<rusqlite::Connection>, P: consensus::Parameters, CL: Clock, R:
         self.transactionally(|wdb| wdb.get_address_for_index(account, diversifier_index, request))
     }
 
+    #[cfg(feature = "transparent-inputs")]
+    fn expose_transparent_receiving_addresses(
+        &mut self,
+        account: Self::AccountId,
+        request: UnifiedAddressRequest,
+        range: Range<NonHardenedChildIndex>,
+    ) -> Result<(), Self::Error> {
+        self.transactionally(|wdb| {
+            wdb.expose_transparent_receiving_addresses(account, request, range)
+        })
+    }
+
     fn update_chain_tip(&mut self, tip_height: BlockHeight) -> Result<(), Self::Error> {
         self.transactionally(|wdb| wdb.update_chain_tip(tip_height))
     }
@@ -1590,6 +1602,25 @@ impl<P: consensus::Parameters, CL: Clock, R: RngCore> WalletWrite
         } else {
             Err(SqliteClientError::AccountUnknown)
         }
+    }
+
+    #[cfg(feature = "transparent-inputs")]
+    fn expose_transparent_receiving_addresses(
+        &mut self,
+        account: Self::AccountId,
+        request: UnifiedAddressRequest,
+        range: Range<NonHardenedChildIndex>,
+    ) -> Result<(), Self::Error> {
+        let account_id = self.get_account_ref(account)?;
+
+        wallet::transparent::expose_address_range(
+            self.conn.0,
+            &self.params,
+            account_id,
+            TransparentKeyScope::EXTERNAL,
+            request,
+            range,
+        )
     }
 
     fn update_chain_tip(&mut self, tip_height: BlockHeight) -> Result<(), Self::Error> {
@@ -2455,6 +2486,9 @@ impl<'a, C: Borrow<rusqlite::Transaction<'a>>, P: consensus::Parameters, CL: Clo
             &self.params,
             account_id,
             key_scope,
+            // The `AddressStore` trait is used for gap-limit preallocation, which does not expose
+            // the generated addresses.
+            None,
             list,
         )
     }
@@ -3644,6 +3678,7 @@ mod tests {
                     wdb.params(),
                     AccountRef(account_rowid),
                     TransparentKeyScope::EXTERNAL,
+                    None,
                     vec![(
                         Address::Transparent(transparent_address),
                         transparent_address,

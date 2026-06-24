@@ -154,6 +154,7 @@ pub(super) fn insert_initial_transparent_addrs<P: consensus::Parameters>(
             UnifiedAddressRequest::ALLOW_ALL,
             start..end,
             false,
+            None,
         )?;
     }
 
@@ -766,6 +767,7 @@ impl<P: consensus::Parameters, C: Clock, R: RngCore> RusqliteMigration for Migra
                         UnifiedAddressRequest::unsafe_custom(Allow, Allow, Require),
                         gap_start..gap_start.saturating_add(gap_limit),
                         false,
+                        None,
                     )?;
                 }
             }

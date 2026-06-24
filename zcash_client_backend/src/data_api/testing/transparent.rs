@@ -1562,6 +1562,87 @@ where
     );
 }
 
+/// Tests that [`WalletWrite::expose_transparent_receiving_addresses`] exposes a contiguous range
+/// of external transparent receiving addresses that extends well beyond the wallet's gap limit,
+/// using the same exposure semantics as [`WalletWrite::get_address_for_index`], and that the
+/// operation is idempotent over overlapping ranges.
+///
+/// [`WalletWrite::expose_transparent_receiving_addresses`]: crate::data_api::WalletWrite::expose_transparent_receiving_addresses
+/// [`WalletWrite::get_address_for_index`]: crate::data_api::WalletWrite::get_address_for_index
+pub fn expose_transparent_receiving_addresses<DSF>(dsf: DSF)
+where
+    DSF: DataStoreFactory,
+{
+    use crate::wallet::Exposure;
+    use transparent::keys::NonHardenedChildIndex;
+    use zcash_keys::keys::ReceiverRequirement;
+
+    // Use a small gap limit so that the exposed range extends well beyond it.
+    let gap_limits = GapLimits::new(5, 2, 2);
+    let mut st = TestBuilder::new()
+        .with_data_store_factory(dsf)
+        .with_gap_limits(gap_limits)
+        .with_account_from_sapling_activation(BlockHash([0; 32]))
+        .build();
+
+    let account_id = st.test_account().unwrap().id();
+
+    // Require a transparent receiver; allow shielded receivers where the diversifier index is
+    // valid, but do not require them so that every index in the range yields an address.
+    let request = UnifiedAddressRequest::unsafe_custom(
+        ReceiverRequirement::Allow,
+        ReceiverRequirement::Allow,
+        ReceiverRequirement::Require,
+    );
+
+    // Expose a contiguous range that extends well beyond the external gap limit (5).
+    let range_end = 50u32;
+    let range =
+        NonHardenedChildIndex::ZERO..NonHardenedChildIndex::from_index(range_end).unwrap();
+    st.wallet_mut()
+        .expose_transparent_receiving_addresses(account_id, request, range)
+        .unwrap();
+
+    let exposures_by_index =
+        |st: &TestState<_, <DSF as DataStoreFactory>::DataStore, LocalNetwork>| {
+            st.wallet()
+                .get_transparent_receivers(account_id, false, true)
+                .unwrap()
+                .into_iter()
+                .filter_map(|(_, meta)| meta.address_index().map(|i| (i.index(), meta.exposure())))
+                .collect::<BTreeMap<_, _>>()
+        };
+
+    let exposed = exposures_by_index(&st);
+
+    // Every index in the requested range must be present and marked as exposed (i.e. with a
+    // recorded exposure height), not merely gap-preallocated with `Exposure::Unknown`.
+    for index in 0..range_end {
+        let exposure = exposed
+            .get(&index)
+            .unwrap_or_else(|| panic!("address at index {index} should have been exposed"));
+        assert_matches!(
+            exposure,
+            Exposure::Exposed { .. },
+            "address at index {index} should be exposed, not gap-preallocated",
+        );
+    }
+
+    // Re-exposing an overlapping sub-range must be an error-free no-op that does not perturb the
+    // already-recorded exposure heights.
+    let overlapping = NonHardenedChildIndex::from_index(range_end / 2).unwrap()
+        ..NonHardenedChildIndex::from_index(range_end).unwrap();
+    st.wallet_mut()
+        .expose_transparent_receiving_addresses(account_id, request, overlapping)
+        .unwrap();
+
+    assert_eq!(
+        exposed,
+        exposures_by_index(&st),
+        "re-exposing an overlapping range must not change recorded exposures",
+    );
+}
+
 /// Tests that [`WalletWrite::mark_transparent_addresses_exposed`] returns an error when
 /// asked to mark an address that the wallet does not track.
 pub fn mark_transparent_addresses_exposed_unknown_address<DSF>(dsf: DSF)

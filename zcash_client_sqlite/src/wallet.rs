@@ -652,6 +652,8 @@ pub(crate) fn add_account<P: consensus::Parameters>(
             UnifiedAddressRequest::ALLOW_ALL,
             NonHardenedChildIndex::const_from_index(0)..default_addr_idx,
             false,
+            // These addresses are preallocated, not exposed.
+            None,
         )?
     }
 

@@ -11,6 +11,14 @@ workspace.
 ## [0.24.0] - PLANNED
 
 ### Added
+- `zcash_client_backend::data_api::WalletWrite::expose_transparent_receiving_addresses`
+  (behind the `transparent-inputs` feature flag): exposes a contiguous range of
+  external transparent receiving addresses in a single pass, with the same
+  exposure semantics as `get_address_for_index`. A default implementation that
+  loops over `get_address_for_index` is provided; backends are encouraged to
+  override it with a more efficient bulk implementation. This is intended to
+  support exchange-scale transparent issuance, where a large contiguous range of
+  addresses must be exposed up front.
 - `zcash_client_backend::data_api::error::RewindError`
 - `zcash_client_backend::wallet::WalletTransparentOutput`:
   - `recipient_account`

@@ -108,15 +108,14 @@ use crate::{
 use {
     crate::wallet::TransparentAddressMetadata,
     getset::{CopyGetters, Getters},
+    std::ops::Range,
     std::time::SystemTime,
-    transparent::{address::TransparentAddress, bundle::OutPoint, keys::TransparentKeyScope},
+    transparent::{
+        address::TransparentAddress,
+        bundle::OutPoint,
+        keys::{NonHardenedChildIndex, TransparentKeyScope},
+    },
 };
-
-#[cfg(all(
-    feature = "transparent-inputs",
-    any(test, feature = "test-dependencies")
-))]
-use {std::ops::Range, transparent::keys::NonHardenedChildIndex};
 
 #[cfg(feature = "zcashd-compat")]
 use zcash_keys::keys::zcashd;
@@ -3084,6 +3083,59 @@ pub trait WalletWrite: WalletRead {
         diversifier_index: DiversifierIndex,
         request: UnifiedAddressRequest,
     ) -> Result<Option<UnifiedAddress>, Self::Error>;
+
+    /// Exposes a contiguous range of external transparent receiving addresses for the specified
+    /// account in a single pass, marking each as exposed at the current chain-tip height.
+    ///
+    /// This is the bulk equivalent of calling [`WalletWrite::get_address_for_index`] for each
+    /// non-hardened child index in `range` on the external transparent receiving chain. It is
+    /// intended for wallets that need to expose a large contiguous range of transparent addresses
+    /// up front (for example, to support exchange-scale transparent receiving where a forward-only
+    /// block scan must cover the whole issued range, and a from-seed restore must recover funds at
+    /// any issued index without an unbounded gap window).
+    ///
+    /// Each address is exposed with the same semantics as
+    /// [`WalletWrite::get_address_for_index`]: it is recorded with the current chain-tip height as
+    /// its exposure height, so that it is subsequently returned by
+    /// [`WalletRead::get_transparent_receivers`] and recovered on restore from seed. Backends are
+    /// expected to implement this more efficiently than the per-index method by loading the
+    /// account's keys only once and reusing a single prepared insert across the whole range; the
+    /// default implementation simply loops over [`WalletWrite::get_address_for_index`].
+    ///
+    /// # Behavior
+    ///
+    /// * **Idempotent / resumable.** It is safe to call this method repeatedly and over
+    ///   overlapping ranges; re-exposing an index that has already been exposed is a cheap no-op.
+    ///   A caller may chunk a large range across multiple calls and resume from the last exposed
+    ///   index after a restart.
+    /// * **Intentional gap-limit bypass.** Like [`WalletWrite::get_address_for_index`], this
+    ///   intentionally exposes addresses beyond the wallet's steady-state gap limit; it does not
+    ///   fail-closed at the gap limit the way [`WalletWrite::get_next_available_address`] does. It
+    ///   is the caller's explicit request to expose the entire range.
+    ///
+    /// # WARNINGS
+    ///
+    /// Exposing transparent addresses beyond the wallet's internally-configured gap limit means
+    /// that funds sent to those addresses are **likely to not be discovered on recovery from
+    /// seed** unless the entire exposed range is rescanned. It is up to the caller to ensure that
+    /// they rescan the full issued range (or otherwise back up the set of exposed indices) so that
+    /// such funds remain recoverable after a loss of wallet data.
+    ///
+    /// [`WalletRead::get_transparent_receivers`]: crate::data_api::WalletRead::get_transparent_receivers
+    #[cfg(feature = "transparent-inputs")]
+    fn expose_transparent_receiving_addresses(
+        &mut self,
+        account: Self::AccountId,
+        request: UnifiedAddressRequest,
+        range: Range<NonHardenedChildIndex>,
+    ) -> Result<(), Self::Error> {
+        let mut next = Some(range.start);
+        while let Some(index) = next.filter(|index| *index < range.end) {
+            self.get_address_for_index(account, index.into(), request)?;
+            next = index.next();
+        }
+        Ok(())
+    }
 
     /// Updates the wallet's view of the blockchain.
     ///

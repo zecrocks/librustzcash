@@ -8,6 +8,16 @@ indicated by the `PLANNED` status in order to make it possible to correctly
 represent the transitive `semver` implications of changes within the enclosing
 workspace.
 
+## [Unreleased]
+
+### Added
+- An efficient implementation of
+  `zcash_client_backend::data_api::WalletWrite::expose_transparent_receiving_addresses`
+  for `WalletDb` (behind the `transparent-inputs` feature flag). It loads the
+  account's keys once and reuses a single prepared insert across the whole
+  range, rather than repeating that work per index as a loop over
+  `get_address_for_index` would.
+
 ## [0.21.0] - 2026-06-02
 
 ### Changed

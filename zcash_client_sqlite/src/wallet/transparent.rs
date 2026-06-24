@@ -662,6 +662,7 @@ pub(crate) fn reserve_next_n_addresses<P: consensus::Parameters>(
 ///
 /// [`WalletWrite::get_next_available_address`]: zcash_client_backend::data_api::WalletWrite::get_next_available_address
 /// [`WalletWrite::get_address_for_index`]: zcash_client_backend::data_api::WalletWrite::get_address_for_index
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_address_range<P: consensus::Parameters>(
     conn: &rusqlite::Transaction,
     params: &P,
@@ -670,6 +671,7 @@ pub(crate) fn generate_address_range<P: consensus::Parameters>(
     request: UnifiedAddressRequest,
     range_to_store: Range<NonHardenedChildIndex>,
     require_key: bool,
+    expose_at: Option<BlockHeight>,
 ) -> Result<(), SqliteClientError> {
     let account = get_account_internal(conn, params, account_id)?
         .ok_or_else(|| SqliteClientError::AccountUnknown)?;
@@ -683,7 +685,57 @@ pub(crate) fn generate_address_range<P: consensus::Parameters>(
         request,
         range_to_store,
         require_key,
+        expose_at,
     )?;
+    Ok(())
+}
+
+/// Exposes a contiguous range of transparent receiving addresses for the given account in a single
+/// pass, marking each as exposed at the current chain-tip height.
+///
+/// This is the bulk equivalent of calling [`WalletWrite::get_address_for_index`] for each
+/// diversifier index in `range_to_store`: it loads the account (and parses its UIVK/UFVK) exactly
+/// once and reuses a single prepared insert statement across the whole range, rather than repeating
+/// that work per index. The chain-tip height is used as the exposure height, falling back to the
+/// account birthday height if the chain tip is unknown, matching `get_address_for_index`.
+///
+/// Like `get_address_for_index`, this intentionally bypasses the wallet's gap limit: it is the
+/// caller's explicit request to expose the entire range. The operation is idempotent and resumable,
+/// so it is safe to call repeatedly and over overlapping ranges.
+///
+/// # Errors
+///
+/// * [`SqliteClientError::AccountUnknown`], if there is no account with the given id.
+///
+/// [`WalletWrite::get_address_for_index`]: zcash_client_backend::data_api::WalletWrite::get_address_for_index
+pub(crate) fn expose_address_range<P: consensus::Parameters>(
+    conn: &rusqlite::Transaction,
+    params: &P,
+    account_id: AccountRef,
+    key_scope: TransparentKeyScope,
+    request: UnifiedAddressRequest,
+    range_to_store: Range<NonHardenedChildIndex>,
+) -> Result<(), SqliteClientError> {
+    let account = get_account_internal(conn, params, account_id)?
+        .ok_or(SqliteClientError::AccountUnknown)?;
+
+    // Use the current chain tip as the exposure height, falling back to the account birthday if the
+    // chain tip is not yet known. This matches the behavior of `get_address_for_index`.
+    let exposure_height = chain_tip_height(conn)?.unwrap_or_else(|| account.birthday());
+
+    generate_address_range_internal(
+        conn,
+        params,
+        account_id,
+        &account.uivk(),
+        account.ufvk(),
+        key_scope,
+        request,
+        range_to_store,
+        false,
+        Some(exposure_height),
+    )?;
+
     Ok(())
 }
 
@@ -698,6 +750,7 @@ pub(crate) fn generate_address_range_internal<P: consensus::Parameters>(
     request: UnifiedAddressRequest,
     range_to_store: Range<NonHardenedChildIndex>,
     require_key: bool,
+    expose_at: Option<BlockHeight>,
 ) -> Result<(), SqliteClientError> {
     let address_list = generate_address_list(
         account_uivk,
@@ -707,31 +760,70 @@ pub(crate) fn generate_address_range_internal<P: consensus::Parameters>(
         range_to_store,
         require_key,
     )?;
-    store_address_range(conn, params, account_id, key_scope, address_list)?;
+    store_address_range(conn, params, account_id, key_scope, expose_at, address_list)?;
     Ok(())
 }
 
+/// Stores a range of derived transparent addresses in the wallet's `addresses` table.
+///
+/// The `expose_at` parameter controls the exposure semantics of the stored addresses:
+///
+/// * `None` performs gap-preallocation: each row is inserted with a NULL `exposed_at_height`,
+///   so the addresses are reserved for future use but are not yet considered exposed by
+///   [`get_transparent_receivers`]. This is the behavior used when extending the gap.
+/// * `Some(height)` exposes each address as of `height`, matching the semantics of
+///   [`WalletWrite::get_address_for_index`]. Any row that was previously gap-preallocated (and
+///   therefore has a NULL `exposed_at_height`) is updated to record the exposure height and to
+///   adopt the freshly-derived unified address; a row that was already exposed keeps the lowest
+///   observed exposure height and its existing address.
+///
+/// In both cases the operation is idempotent: re-deriving an index that already exists is a cheap
+/// no-op (modulo lowering an exposure height), so the method is safe to call repeatedly and over
+/// overlapping ranges.
+///
+/// [`get_transparent_receivers`]: zcash_client_backend::data_api::WalletRead::get_transparent_receivers
+/// [`WalletWrite::get_address_for_index`]: zcash_client_backend::data_api::WalletWrite::get_address_for_index
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn store_address_range<P: consensus::Parameters>(
     conn: &rusqlite::Transaction,
     params: &P,
     account_id: AccountRef,
     key_scope: TransparentKeyScope,
+    expose_at: Option<BlockHeight>,
     address_list: Vec<(Address, TransparentAddress, NonHardenedChildIndex)>,
 ) -> Result<(), SqliteClientError> {
-    // exposed_at_height is initially NULL
+    // When we are exposing addresses, an already-gap-preallocated row (which has a NULL
+    // `exposed_at_height`) should be updated to adopt the freshly-derived address, exactly as
+    // `upsert_address` does for `get_address_for_index`. When we are merely preallocating gap
+    // addresses we never overwrite an existing row.
+    let force_update_address = expose_at.is_some();
     let mut stmt_insert_address = conn.prepare_cached(
         "INSERT INTO addresses (
             account_id, diversifier_index_be, key_scope, address,
             transparent_child_index, cached_transparent_receiver_address,
-            receiver_flags
+            exposed_at_height, receiver_flags
          )
          VALUES (
             :account_id, :diversifier_index_be, :key_scope, :address,
             :transparent_child_index, :transparent_address,
-            :receiver_flags
+            :exposed_at_height, :receiver_flags
          )
-         ON CONFLICT (account_id, diversifier_index_be, key_scope) DO NOTHING",
+         ON CONFLICT (account_id, diversifier_index_be, key_scope) DO UPDATE
+         SET exposed_at_height = COALESCE(
+                 MIN(exposed_at_height, :exposed_at_height),
+                 exposed_at_height,
+                 :exposed_at_height
+             ),
+             address = IIF(
+                 exposed_at_height IS NULL AND :force_update_address,
+                 :address,
+                 address
+             ),
+             receiver_flags = IIF(
+                 exposed_at_height IS NULL AND :force_update_address,
+                 :receiver_flags,
+                 receiver_flags
+             )",
     )?;
 
     for (address, transparent_address, transparent_child_index) in address_list {
@@ -748,6 +840,8 @@ pub(crate) fn store_address_range<P: consensus::Parameters>(
             ":address": zcash_address.encode(),
             ":transparent_child_index": transparent_child_index.index(),
             ":transparent_address": transparent_address.encode(params),
+            ":exposed_at_height": expose_at.map(u32::from),
+            ":force_update_address": force_update_address,
             ":receiver_flags": receiver_flags.bits()
         ])?;
     }
@@ -790,6 +884,8 @@ pub(crate) fn generate_gap_addresses<P: consensus::Parameters>(
             request,
             gap_start..gap_start.saturating_add(gap_limit),
             require_key,
+            // Gap addresses are preallocated, not exposed.
+            None,
         )?;
     }
 
@@ -2625,6 +2721,13 @@ mod tests {
     #[test]
     fn mark_transparent_addresses_exposed_unknown_address() {
         zcash_client_backend::data_api::testing::transparent::mark_transparent_addresses_exposed_unknown_address(
+            TestDbFactory::default(),
+        );
+    }
+
+    #[test]
+    fn expose_transparent_receiving_addresses() {
+        zcash_client_backend::data_api::testing::transparent::expose_transparent_receiving_addresses(
             TestDbFactory::default(),
         );
     }
