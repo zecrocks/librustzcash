@@ -2731,4 +2731,39 @@ mod tests {
             TestDbFactory::default(),
         );
     }
+
+    #[test]
+    fn expose_transparent_receiving_addresses_beyond_gap_limit() {
+        zcash_client_backend::data_api::testing::transparent::expose_transparent_receiving_addresses_beyond_gap_limit(
+            TestDbFactory::default(),
+        );
+    }
+
+    #[test]
+    fn expose_transparent_receiving_addresses_unknown_account() {
+        use ::transparent::keys::NonHardenedChildIndex;
+        use uuid::Uuid;
+        use zcash_client_backend::data_api::{WalletWrite, testing::TestBuilder};
+        use zcash_keys::keys::UnifiedAddressRequest;
+        use zcash_primitives::block::BlockHash;
+
+        let mut st = TestBuilder::new()
+            .with_data_store_factory(TestDbFactory::default())
+            .with_account_from_sapling_activation(BlockHash([0; 32]))
+            .build();
+
+        // An account UUID that does not correspond to any account in the wallet.
+        let unknown = crate::AccountUuid::from_uuid(Uuid::nil());
+        let range =
+            NonHardenedChildIndex::ZERO..NonHardenedChildIndex::from_index(10).unwrap();
+        let result = st.wallet_mut().expose_transparent_receiving_addresses(
+            unknown,
+            UnifiedAddressRequest::ALLOW_ALL,
+            range,
+        );
+        assert!(
+            matches!(result, Err(SqliteClientError::AccountUnknown)),
+            "expected AccountUnknown, got {result:?}",
+        );
+    }
 }

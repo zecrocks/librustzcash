@@ -1573,8 +1573,8 @@ pub fn expose_transparent_receiving_addresses<DSF>(dsf: DSF)
 where
     DSF: DataStoreFactory,
 {
-    use crate::wallet::Exposure;
-    use transparent::keys::NonHardenedChildIndex;
+    use crate::{data_api::WalletRead, wallet::Exposure};
+    use transparent::keys::{IncomingViewingKey, NonHardenedChildIndex};
     use zcash_keys::keys::ReceiverRequirement;
 
     // Use a small gap limit so that the exposed range extends well beyond it.
@@ -1585,7 +1585,27 @@ where
         .with_account_from_sapling_activation(BlockHash([0; 32]))
         .build();
 
-    let account_id = st.test_account().unwrap().id();
+    let test_account = st.test_account().cloned().unwrap();
+    let account_id = test_account.account().id();
+
+    // The external transparent IVK, used to independently re-derive the expected receiver at each
+    // index so that we can confirm the bulk path stored the correct, contiguous addresses.
+    let external_ivk = test_account
+        .account()
+        .ufvk()
+        .unwrap()
+        .transparent()
+        .unwrap()
+        .derive_external_ivk()
+        .unwrap();
+
+    // Establish a chain tip above the account birthday so that we can confirm that addresses are
+    // exposed at the chain-tip height, matching `get_address_for_index`. We read the recorded tip
+    // back from the wallet (rather than assuming an exact value) to avoid coupling the test to the
+    // scan-queue height arithmetic.
+    let target_tip = test_account.account().birthday_height() + 1000;
+    st.wallet_mut().update_chain_tip(target_tip).unwrap();
+    let chain_tip = st.wallet().chain_height().unwrap().unwrap();
 
     // Require a transparent receiver; allow shielded receivers where the diversifier index is
     // valid, but do not require them so that every index in the range yields an address.
@@ -1595,41 +1615,80 @@ where
         ReceiverRequirement::Require,
     );
 
-    // Expose a contiguous range that extends well beyond the external gap limit (5).
+    let receivers_by_index =
+        |st: &TestState<_, <DSF as DataStoreFactory>::DataStore, LocalNetwork>| {
+            st.wallet()
+                .get_transparent_receivers(account_id, false, true)
+                .unwrap()
+                .into_iter()
+                .filter_map(|(addr, meta)| {
+                    meta.address_index().map(|i| (i.index(), (addr, meta.exposure())))
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+
+    // The range we are about to expose must extend well beyond any address that already exists as
+    // a result of account creation (a gap limit's worth of low-index addresses), so that the test
+    // genuinely exercises exposure beyond the gap limit.
     let range_end = 50u32;
+    let before = receivers_by_index(&st);
+    assert!(
+        before.keys().all(|index| *index < range_end - 1),
+        "the exposed range must extend beyond all pre-existing addresses",
+    );
+
+    // Expose a contiguous range that extends well beyond the external gap limit (5).
     let range =
         NonHardenedChildIndex::ZERO..NonHardenedChildIndex::from_index(range_end).unwrap();
     st.wallet_mut()
         .expose_transparent_receiving_addresses(account_id, request, range)
         .unwrap();
 
-    let exposures_by_index =
-        |st: &TestState<_, <DSF as DataStoreFactory>::DataStore, LocalNetwork>| {
-            st.wallet()
-                .get_transparent_receivers(account_id, false, true)
-                .unwrap()
-                .into_iter()
-                .filter_map(|(_, meta)| meta.address_index().map(|i| (i.index(), meta.exposure())))
-                .collect::<BTreeMap<_, _>>()
-        };
+    let after = receivers_by_index(&st);
 
-    let exposed = exposures_by_index(&st);
-
-    // Every index in the requested range must be present and marked as exposed (i.e. with a
-    // recorded exposure height), not merely gap-preallocated with `Exposure::Unknown`.
     for index in 0..range_end {
-        let exposure = exposed
+        let (taddr, exposure) = after
             .get(&index)
             .unwrap_or_else(|| panic!("address at index {index} should have been exposed"));
-        assert_matches!(
-            exposure,
-            Exposure::Exposed { .. },
-            "address at index {index} should be exposed, not gap-preallocated",
+
+        // Every index in the requested range must be exposed (i.e. have a recorded exposure
+        // height), not merely gap-preallocated with `Exposure::Unknown`.
+        let at_height = match exposure {
+            Exposure::Exposed { at_height, .. } => *at_height,
+            other => panic!("address at index {index} should be exposed, got {other:?}"),
+        };
+
+        // Addresses newly exposed by the bulk call (those that did not already exist from account
+        // creation) must be recorded at the current chain-tip height, matching the semantics of
+        // `get_address_for_index`. Pre-existing addresses retain their (lower) original exposure
+        // height under the idempotent `MIN` semantics, so we only assert the tip for new ones.
+        if !before.contains_key(&index) {
+            assert_eq!(
+                at_height, chain_tip,
+                "newly-exposed address at index {index} should be exposed at the chain tip",
+            );
+        }
+
+        // The bulk-exposed receiver must be the canonical external transparent address derived at
+        // this index: this is the "batched equivalent of `get_address_for_index`" contract.
+        let expected_taddr = external_ivk
+            .derive_address(NonHardenedChildIndex::from_index(index).unwrap())
+            .unwrap();
+        assert_eq!(
+            *taddr, expected_taddr,
+            "bulk-exposed address at index {index} must be the canonically-derived receiver",
         );
     }
 
+    // The exposed range must reach indices beyond the gap limit that did not previously exist.
+    let last_index = range_end - 1;
+    assert!(
+        !before.contains_key(&last_index) && after.contains_key(&last_index),
+        "exposure must extend beyond the gap limit to previously-unknown indices",
+    );
+
     // Re-exposing an overlapping sub-range must be an error-free no-op that does not perturb the
-    // already-recorded exposure heights.
+    // already-recorded receivers or their exposure heights.
     let overlapping = NonHardenedChildIndex::from_index(range_end / 2).unwrap()
         ..NonHardenedChildIndex::from_index(range_end).unwrap();
     st.wallet_mut()
@@ -1637,9 +1696,73 @@ where
         .unwrap();
 
     assert_eq!(
-        exposed,
-        exposures_by_index(&st),
-        "re-exposing an overlapping range must not change recorded exposures",
+        after,
+        receivers_by_index(&st),
+        "re-exposing an overlapping range must not change recorded receivers",
+    );
+}
+
+/// Tests that [`WalletWrite::expose_transparent_receiving_addresses`] does not fail-closed at the
+/// gap limit: a caller may expose a range arbitrarily larger than the configured gap limit.
+///
+/// This is the behavior that distinguishes it from
+/// [`WalletWrite::get_next_available_address`](crate::data_api::WalletWrite::get_next_available_address),
+/// which stops at the gap limit; like [`WalletWrite::get_address_for_index`], exposing an explicit
+/// range is the caller's deliberate request and must be honored in full.
+///
+/// [`WalletWrite::expose_transparent_receiving_addresses`]: crate::data_api::WalletWrite::expose_transparent_receiving_addresses
+/// [`WalletWrite::get_address_for_index`]: crate::data_api::WalletWrite::get_address_for_index
+pub fn expose_transparent_receiving_addresses_beyond_gap_limit<DSF>(dsf: DSF)
+where
+    DSF: DataStoreFactory,
+{
+    use crate::{data_api::WalletRead, wallet::Exposure};
+    use transparent::keys::NonHardenedChildIndex;
+    use zcash_keys::keys::ReceiverRequirement;
+
+    // A deliberately tiny gap limit, so that the exposed range dwarfs it by three orders of
+    // magnitude.
+    let gap_limits = GapLimits::new(1, 1, 1);
+    let mut st = TestBuilder::new()
+        .with_data_store_factory(dsf)
+        .with_gap_limits(gap_limits)
+        .with_account_from_sapling_activation(BlockHash([0; 32]))
+        .build();
+
+    let account_id = st.test_account().cloned().unwrap().account().id();
+    let request = UnifiedAddressRequest::unsafe_custom(
+        ReceiverRequirement::Allow,
+        ReceiverRequirement::Allow,
+        ReceiverRequirement::Require,
+    );
+
+    // `get_next_available_address` would fail-closed at the gap limit (1) long before reaching
+    // this many addresses; the explicit-range method must expose the whole range without error.
+    let range_end = 1_000u32;
+    let range =
+        NonHardenedChildIndex::ZERO..NonHardenedChildIndex::from_index(range_end).unwrap();
+    st.wallet_mut()
+        .expose_transparent_receiving_addresses(account_id, request, range)
+        .expect("exposing a range far beyond the gap limit must not fail-closed");
+
+    // The whole range was issued: every index in `0..range_end` is exposed, including the highest.
+    let exposed_indices = st
+        .wallet()
+        .get_transparent_receivers(account_id, false, true)
+        .unwrap()
+        .into_values()
+        .filter(|meta| matches!(meta.exposure(), Exposure::Exposed { .. }))
+        .filter_map(|meta| meta.address_index().map(|i| i.index()))
+        .filter(|index| *index < range_end)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        u32::try_from(exposed_indices.len()).unwrap(),
+        range_end,
+        "every index in the exposed range should be present",
+    );
+    assert!(
+        exposed_indices.contains(&(range_end - 1)),
+        "the highest index in the range should be exposed",
     );
 }
 
