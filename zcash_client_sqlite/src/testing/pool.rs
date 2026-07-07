@@ -806,3 +806,90 @@ pub(crate) fn shielding_coinbase_to_orchard_receiver_delivers_via_ironwood() {
         BlockCache::new(),
     );
 }
+
+/// Regression test for the Ironwood checkpoint-pruning panic.
+///
+/// Cross-pool checkpoint synchronization gives the Ironwood note-commitment tree a checkpoint at
+/// every height that any other pool is checkpointed at, even when the wallet holds no Ironwood
+/// notes of its own. If the wallet fails to truncate the Ironwood tree in lockstep with the
+/// Sapling and Orchard trees on a rewind, those Ironwood checkpoints desynchronize from block
+/// state; a later `prune_excess_checkpoints` can then descend into a pruned leaf that spans
+/// multiple distinct checkpoint positions and panic with
+/// "Tree state inconsistent with checkpoints." (a `panic!`, not a recoverable `Err`, which
+/// renders the database unsyncable).
+///
+/// This test scans a range of blocks paying a foreign key — so the wallet tracks no notes in any
+/// pool and the Ironwood tree accumulates checkpoints purely through cross-pool synchronization —
+/// then rewinds via `truncate_to_height`. It asserts that the Ironwood checkpoint table is
+/// truncated in lockstep with the Orchard tree, with no checkpoint surviving above the truncation
+/// height. Before the fix the Ironwood tree was left untouched across the rewind and would retain
+/// its checkpoints.
+#[cfg(feature = "orchard")]
+pub(crate) fn truncate_to_height_truncates_ironwood_tree<T: ShieldedPoolTester>() {
+    use zcash_client_backend::data_api::{
+        WalletWrite,
+        testing::{AddressType, pool::dsl::TestDsl},
+    };
+    use zcash_protocol::{
+        consensus::{NetworkUpgrade, Parameters},
+        value::Zatoshis,
+    };
+
+    use crate::{IRONWOOD_TABLES_PREFIX, wallet::commitment_tree::max_checkpoint_id};
+
+    let mut st =
+        TestDsl::with_sapling_birthday_account(TestDbFactory::default(), BlockCache::new())
+            .build::<T>();
+    let activation = st
+        .network()
+        .activation_height(NetworkUpgrade::Sapling)
+        .unwrap();
+
+    // Pay a foreign viewing key so the wallet tracks no notes of its own in any pool; the Ironwood
+    // tree in particular gains checkpoints only through cross-pool synchronization, exactly as it
+    // does on a testnet wallet that holds no Ironwood notes.
+    let other_fvk = T::sk_to_fvk(&T::sk(&[7u8; 32]));
+    let block_count = 8u32;
+    for _ in 0..block_count {
+        st.generate_next_block(
+            &other_fvk,
+            AddressType::DefaultExternal,
+            Zatoshis::const_from_u64(10_000),
+        );
+    }
+    st.scan_cached_blocks(activation, block_count as usize);
+
+    // Choose a rewind target below the tip so that some checkpoints must be removed.
+    let tip = activation + block_count - 1;
+    let target = activation + 3;
+    assert!(target < tip);
+
+    // Precondition: cross-pool synchronization must have populated Ironwood checkpoints above the
+    // rewind target, otherwise the test would pass vacuously.
+    let ironwood_max_before = max_checkpoint_id(st.wallet().conn(), IRONWOOD_TABLES_PREFIX)
+        .unwrap()
+        .expect("Ironwood tree should have cross-pool checkpoints after scanning");
+    assert!(
+        ironwood_max_before > target,
+        "test precondition: Ironwood should hold checkpoints above the rewind target \
+         (max = {ironwood_max_before:?}, target = {target:?})",
+    );
+
+    // Rewind. Before the fix this left the Ironwood tree untouched.
+    st.wallet_mut().truncate_to_height(target).unwrap();
+
+    // The Ironwood tree must be truncated in lockstep with the Orchard tree: no checkpoint may
+    // survive above the truncation height.
+    let ironwood_max_after =
+        max_checkpoint_id(st.wallet().conn(), IRONWOOD_TABLES_PREFIX).unwrap();
+    let orchard_max_after = max_checkpoint_id(st.wallet().conn(), ORCHARD_TABLES_PREFIX).unwrap();
+    assert_eq!(
+        ironwood_max_after, orchard_max_after,
+        "Ironwood tree must be truncated in lockstep with the Orchard tree",
+    );
+    assert!(
+        ironwood_max_after.is_some_and(|h| h <= target),
+        "Ironwood tree must not retain any checkpoint above the truncation height \
+         (max after = {ironwood_max_after:?}, target = {target:?})",
+    );
+}

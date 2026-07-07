@@ -108,6 +108,15 @@ workspace.
   the migration to abort.
 
 ### Fixed
+- Wallet truncation (`truncate_to_height` / `truncate_to_chain_state`, and the rewind paths
+  built on them) now truncates the Ironwood note commitment tree in lockstep with the Sapling
+  and Orchard trees. Previously only the Sapling and Orchard trees were truncated on a rewind,
+  leaving the Ironwood tree's checkpoints — which are populated by cross-pool checkpoint
+  synchronization even for wallets that hold no Ironwood notes — desynchronized from block
+  state. Once such a tree accumulated more than `max_checkpoints` (100) checkpoints, the
+  `shardtree` checkpoint pruner could descend into a pruned leaf spanning multiple distinct
+  checkpoint positions and abort the process with a `panic!` ("Tree state inconsistent with
+  checkpoints."), rendering the database unsyncable.
 - Deriving a transparent address that was previously imported as a standalone receiver now
   upgrades the existing address record in place to its derived form, instead of failing on the
   transparent-receiver uniqueness invariant added in this release. If the import was recorded

@@ -424,6 +424,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "orchard")]
+    fn truncate_to_height_truncates_ironwood_tree() {
+        testing::pool::truncate_to_height_truncates_ironwood_tree::<SaplingPoolTester>()
+    }
+
+    #[test]
     fn rewind_to_chain_state_deep_sapling() {
         testing::pool::rewind_to_chain_state_deep::<SaplingPoolTester>()
     }
