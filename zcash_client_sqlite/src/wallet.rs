@@ -86,7 +86,7 @@ use uuid::Uuid;
 
 use zcash_address::ZcashAddress;
 use zcash_client_backend::{
-    DecryptedOutput,
+    DecryptedOutput, decrypt_transaction,
     data_api::{
         Account as _, AccountBalance, AccountBirthday, AccountPurpose, AccountSource, AddressInfo,
         AddressSource, BlockMetadata, Progress, Ratio, ReceivedTransactionOutput,
@@ -3589,6 +3589,119 @@ pub(crate) fn store_transaction_to_be_sent<P: consensus::Parameters>(
     // component will be detected via ordinary chain scanning and/or nullifier checking.
     if !detectable_via_scanning {
         queue_tx_retrieval(conn, std::iter::once(sent_tx.tx().txid()), None)?;
+    }
+
+    Ok(())
+}
+
+/// Backfills received-note memos for the wallet's own shielded self-send outputs.
+///
+/// A shielded payment to one of the wallet's own addresses is recorded as a
+/// [`Recipient::External`], so [`store_transaction_to_be_sent`] does not create a received note
+/// for it: the note is instead detected later by ordinary compact-block scanning. Compact outputs
+/// carry no memo, so the scanned note's memo is stored as NULL, and the enhancement step that
+/// would otherwise backfill it (`decrypt_and_store_transaction`) never runs for the wallet's own
+/// transactions, because their `raw` bytes are pre-stored and so those transactions are only ever
+/// queued for a status check, never for enhancement. As a result the memo would remain NULL. This
+/// is most visible in the Ironwood (NU6.3) pool, where every write is a self-send.
+///
+/// This function runs after each block scan and fills those memos in from the locally stored
+/// `raw` transaction bytes. It performs a memo-only UPDATE against received-note rows that ALREADY
+/// EXIST (created by scanning); it never inserts a note. That preserves the invariant that a
+/// payment to one of the wallet's own addresses must not re-enter the balance until it has been
+/// mined and scanned from the chain.
+pub(crate) fn backfill_self_send_memos<P: consensus::Parameters>(
+    conn: &rusqlite::Transaction,
+    params: &P,
+) -> Result<(), SqliteClientError> {
+    // Collect transactions for which we hold the raw bytes, that are mined, and that have at least
+    // one scanned received note whose memo is still NULL. Restricting to `raw IS NOT NULL` limits
+    // this to transactions the wallet itself stored (its own sends); notes received from others do
+    // not carry `raw` until enhancement fetches it, at which point that path fills their memos.
+    let candidates: Vec<(TxRef, Vec<u8>, BlockHeight)> = {
+        let mut stmt = conn.prepare(
+            "SELECT t.id_tx, t.raw, t.mined_height
+             FROM transactions t
+             WHERE t.raw IS NOT NULL
+               AND t.mined_height IS NOT NULL
+               AND EXISTS (
+                   SELECT 1 FROM sapling_received_notes rn
+                       WHERE rn.transaction_id = t.id_tx AND rn.memo IS NULL
+                   UNION ALL
+                   SELECT 1 FROM orchard_received_notes rn
+                       WHERE rn.transaction_id = t.id_tx AND rn.memo IS NULL
+                   UNION ALL
+                   SELECT 1 FROM ironwood_received_notes rn
+                       WHERE rn.transaction_id = t.id_tx AND rn.memo IS NULL
+               )",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                TxRef(row.get(0)?),
+                row.get::<_, Vec<u8>>(1)?,
+                BlockHeight::from(row.get::<_, u32>(2)?),
+            ))
+        })?;
+        rows.collect::<Result<_, _>>()?
+    };
+
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    let ufvks = get_unified_full_viewing_keys(conn, params)?;
+
+    // A memo-only UPDATE: it touches only rows that already exist and whose memo is still NULL, so
+    // it can neither insert a balance-counted note nor clobber a memo that was already recorded.
+    let update_memo = |shielded_pool: ShieldedPool,
+                       tx_ref: TxRef,
+                       index: usize,
+                       memo: &MemoBytes|
+     -> Result<(), SqliteClientError> {
+        let TableConstants {
+            table_prefix,
+            output_index_col,
+            ..
+        } = table_constants::<SqliteClientError>(shielded_pool)?;
+        conn.execute(
+            &format!(
+                "UPDATE {table_prefix}_received_notes
+                 SET memo = :memo
+                 WHERE transaction_id = :transaction_id
+                   AND {output_index_col} = :output_index
+                   AND memo IS NULL"
+            ),
+            named_params![
+                ":memo": memo_repr(Some(memo)),
+                ":transaction_id": tx_ref.0,
+                ":output_index": i64::try_from(index)
+                    .expect("output indices are representable as i64"),
+            ],
+        )?;
+        Ok(())
+    };
+
+    for (tx_ref, raw, mined_height) in candidates {
+        let (_, tx) = parse_tx(params, &raw, Some(mined_height), None)?;
+        let d_tx = decrypt_transaction(params, Some(mined_height), None, &tx, &ufvks);
+
+        for output in d_tx.sapling_outputs() {
+            if output.transfer_type() != TransferType::Outgoing {
+                update_memo(ShieldedPool::Sapling, tx_ref, output.index(), output.memo())?;
+            }
+        }
+        #[cfg(feature = "orchard")]
+        for output in d_tx.orchard_outputs() {
+            if output.transfer_type() != TransferType::Outgoing {
+                update_memo(ShieldedPool::Orchard, tx_ref, output.index(), output.memo())?;
+            }
+        }
+        #[cfg(feature = "orchard")]
+        for output in d_tx.ironwood_outputs() {
+            if output.transfer_type() != TransferType::Outgoing {
+                update_memo(ShieldedPool::Ironwood, tx_ref, output.index(), output.memo())?;
+            }
+        }
     }
 
     Ok(())

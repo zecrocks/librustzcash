@@ -1421,6 +1421,163 @@ pub(crate) mod tests {
         );
     }
 
+    /// A shielded payment to one of the wallet's own addresses is a `Recipient::External`, so no
+    /// received note is stored at send time; the note is detected later by compact-block scanning,
+    /// which cannot see the memo (compact outputs carry none), and the enhancement path that would
+    /// backfill the memo never runs for the wallet's own (raw-present) transactions. Without the
+    /// post-scan backfill the received note's memo stays NULL. This bites the Ironwood pool
+    /// hardest, where every write is a self-send. This test drives the real send path
+    /// (`propose_transfer` + `create_proposed_transactions`, so `raw` is pre-stored), mines and
+    /// scans the self-send, and asserts the wallet's own Ironwood received note carries the memo.
+    #[test]
+    #[cfg(feature = "orchard")]
+    fn self_send_with_memo_backfills_received_ironwood_memo() {
+        use std::collections::HashMap;
+        use std::convert::Infallible;
+
+        use zcash_client_backend::{
+            TransferType,
+            data_api::{
+                Account, WalletRead,
+                testing::{
+                    AddressType, IronwoodFvk, TestBuilder, orchard::OrchardPoolTester,
+                    pool::ShieldedPoolTester,
+                },
+                wallet::ConfirmationsPolicy,
+                wallet::input_selection::GreedyInputSelector,
+            },
+            decrypt_transaction,
+            fees::{DustOutputPolicy, StandardFeeRule, standard},
+            wallet::{NoteId, OvkPolicy},
+        };
+        use zcash_keys::address::Address;
+        use zcash_primitives::block::BlockHash;
+        use zcash_protocol::{
+            ShieldedPool,
+            consensus::BlockHeight,
+            local_consensus::LocalNetwork,
+            memo::{Memo, MemoBytes},
+            value::Zatoshis,
+        };
+        use zip321::{Payment, TransactionRequest};
+
+        use crate::testing::{BlockCache, db::TestDbFactory};
+
+        let activation = BlockHeight::from_u32(100_000);
+        let network = LocalNetwork {
+            nu6: Some(activation),
+            nu6_1: Some(activation),
+            nu6_2: Some(activation),
+            nu6_3: Some(activation),
+            ..TestBuilder::<(), ()>::DEFAULT_NETWORK
+        };
+
+        let mut st = TestBuilder::new()
+            .with_network(network)
+            .with_data_store_factory(TestDbFactory::default())
+            .with_block_cache(BlockCache::new())
+            .with_account_from_sapling_activation(BlockHash([0; 32]))
+            .build();
+
+        let account = st.test_account().cloned().unwrap();
+        let account_id = account.id();
+        let account_fvk = OrchardPoolTester::test_account_fvk(&st);
+
+        // Fund the account with an Ironwood note.
+        let received = IronwoodFvk(account_fvk.clone());
+        let note_value = Zatoshis::const_from_u64(100_000);
+        let (h, _, _) = st.generate_next_block(&received, AddressType::DefaultExternal, note_value);
+        st.scan_cached_blocks(h, 1);
+        // Advance a few blocks so a spendable anchor exists.
+        for _ in 0..5 {
+            let (h, _) = st.generate_empty_block();
+            st.scan_cached_blocks(h, 1);
+        }
+
+        // Pay the account's own Orchard address with a nonempty memo. While Ironwood is active this
+        // is created as a wallet-owned Ironwood (V6) self-send.
+        let memo = Memo::from_bytes(b"ironwood self-send memo backfill").unwrap();
+        let memo_bytes = MemoBytes::from(&memo);
+        let to: Address = OrchardPoolTester::fvk_default_address(&account_fvk);
+        let payment_value = Zatoshis::const_from_u64(10_000);
+        let request = TransactionRequest::new(vec![
+            Payment::new(
+                to.to_zcash_address(st.network()),
+                Some(payment_value),
+                Some(memo_bytes.clone()),
+                None,
+                None,
+                vec![],
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+
+        let change_strategy = standard::SingleOutputChangeStrategy::new(
+            StandardFeeRule::Zip317,
+            None,
+            ShieldedPool::Orchard,
+            DustOutputPolicy::default(),
+        );
+        let input_selector = GreedyInputSelector::new();
+        let proposal = st
+            .propose_transfer(
+                account_id,
+                &input_selector,
+                &change_strategy,
+                request,
+                ConfirmationsPolicy::MIN,
+            )
+            .unwrap();
+        let created = st
+            .create_proposed_transactions::<Infallible, _, Infallible, _>(
+                account.usk(),
+                OvkPolicy::Sender,
+                &proposal,
+            )
+            .unwrap();
+        let txid = created[0];
+
+        // Mine the self-send and scan it. Scanning creates the received note but records a NULL
+        // memo; the post-scan backfill then fills it from the locally stored raw transaction.
+        let (mined_h, _) = st.generate_next_block_including(txid);
+        st.scan_cached_blocks(mined_h, 1);
+
+        // Locate the Ironwood self-payment output (value == payment_value) among the wallet-owned
+        // outputs of the mined transaction.
+        let tx = st
+            .wallet()
+            .get_transaction(txid)
+            .unwrap()
+            .expect("The sent transaction was stored.");
+        let mut ufvks = HashMap::new();
+        ufvks.insert(account_id, account.ufvk().unwrap().clone());
+        let d_tx = decrypt_transaction(st.network(), Some(mined_h), None, &tx, &ufvks);
+        let payment_index = d_tx
+            .ironwood_outputs()
+            .iter()
+            .find(|o| {
+                o.transfer_type() != TransferType::Outgoing
+                    && o.note().0.value().inner() == payment_value.into_u64()
+            })
+            .map(|o| o.index())
+            .expect("the Ironwood self-payment output must be present");
+
+        // Read the memo straight from the ironwood_received_notes table (not sent_notes), so a
+        // fallback cannot mask a NULL received-note memo.
+        let note_id = NoteId::new(
+            txid,
+            ShieldedPool::Ironwood,
+            u16::try_from(payment_index).unwrap(),
+        );
+        let got = crate::wallet::get_received_memo(st.wallet().conn(), note_id).unwrap();
+        assert_eq!(
+            got,
+            Some(memo),
+            "the wallet's own Ironwood received note must carry the self-send memo"
+        );
+    }
+
     #[test]
     #[cfg(feature = "orchard")]
     fn get_unspent_orchard_notes_at_historical_height_boundary_heights() {
