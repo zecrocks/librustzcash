@@ -1758,7 +1758,16 @@ impl<P: consensus::Parameters, CL: Clock, R: RngCore> WalletWrite
             blocks,
             anchor_retention_height,
         )
-        .map_err(SqliteClientError::from)
+        .map_err(SqliteClientError::from)?;
+
+        // Backfill memos for the wallet's own shielded self-sends. Scanning creates the received
+        // note for a payment to one of the wallet's own addresses, but compact outputs carry no
+        // memo and the enhancement path never runs for the wallet's own (raw-present) transactions,
+        // so the memo would otherwise stay NULL. This is a memo-only UPDATE of notes that scanning
+        // already persisted; it never inserts a note, so it cannot affect balances.
+        wallet::backfill_self_send_memos(self.conn.0, &self.params)?;
+
+        Ok(())
     }
 
     fn put_received_transparent_utxo(
