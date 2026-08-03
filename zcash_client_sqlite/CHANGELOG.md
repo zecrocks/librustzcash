@@ -19,6 +19,12 @@ workspace.
   large transparent gap limit, where gap maintenance runs once per observed
   transparent output or spend and previously re-derived the whole window each
   time.
+- Recording the transparent outputs and spends of a transaction now maintains
+  the transparent address gap window once per (account, key scope) pair
+  involved in that transaction, instead of once per output or spend. This is
+  not observable in the contents of the wallet database, but it removes a
+  quadratic factor in the cost of recording a transaction with many transparent
+  outputs.
 
 ## [0.22.0-rc.6] - 2026-07-29
 
