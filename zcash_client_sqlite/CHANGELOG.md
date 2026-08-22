@@ -17,6 +17,13 @@ workspace.
   previously conflated with `transactions_without_wallet_relevance`.
 
 ### Fixed
+- `WalletDb::transaction_data_requests` no longer returns duplicate
+  `TransactionDataRequest::TransactionsInvolvingAddress` requests for the
+  transparent outputs of a single transaction. A transaction having `k` unspent
+  transparent outputs belonging to the wallet previously produced `k^2`
+  spend-detection requests instead of `k`, and did so again on each advance of
+  the chain tip. This did not affect wallets built with the `spend-index`
+  feature.
 - Reading back a stored unmined transaction with a zero expiry height (such as
   a coinbase transaction imported from a zcashd wallet before any chain scan)
   no longer fails with a "Consensus branch ID not known" error. When neither a

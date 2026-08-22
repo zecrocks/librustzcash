@@ -2346,7 +2346,12 @@ pub(crate) fn transaction_data_requests<P: consensus::Parameters>(
                 COALESCE(tro.max_observed_unspent_height + 1, t.mined_height) AS block_range_start
              FROM transparent_spend_search_queue ssq
              JOIN transactions t ON t.id_tx = ssq.transaction_id
-             JOIN transparent_received_outputs tro ON tro.transaction_id = t.id_tx
+             -- Each queue row is a request to find the spend of one outpoint, so it must
+             -- match only the received output at that outpoint; joining on the transaction
+             -- alone would pair every queue row with every unspent output of the same
+             -- transaction, producing one request per pair.
+             JOIN transparent_received_outputs tro
+                ON tro.transaction_id = t.id_tx AND tro.output_index = ssq.output_index
              JOIN addresses ON addresses.id = tro.address_id
              LEFT OUTER JOIN transparent_received_output_spends tros
                 ON tros.transparent_received_output_id = tro.id
@@ -2907,7 +2912,7 @@ mod tests {
     use zcash_primitives::block::BlockHash;
 
     use crate::{
-        GapLimits, WalletDb,
+        GapLimits, TxRef, WalletDb,
         error::SqliteClientError,
         testing::{BlockCache, db::TestDbFactory},
         wallet::{
@@ -2918,6 +2923,8 @@ mod tests {
         },
     };
     use rusqlite::named_params;
+    #[cfg(not(feature = "spend-index"))]
+    use zcash_client_backend::data_api::TransactionDataRequest;
     use zcash_keys::keys::{ReceiverRequirement, UnifiedAddressRequest};
     use zcash_protocol::value::Zatoshis;
     #[cfg(feature = "transparent-key-import")]
@@ -3046,7 +3053,7 @@ mod tests {
         use zcash_keys::{encoding::AddressCodec as _, keys::UnifiedAddressRequest};
         use zcash_protocol::value::Zatoshis;
 
-        use crate::{TxRef, wallet::put_sent_output};
+        use crate::wallet::put_sent_output;
 
         let mut st = TestBuilder::new()
             .with_data_store_factory(TestDbFactory::default())
@@ -3800,6 +3807,110 @@ mod tests {
         )
         .unwrap();
         tx.commit().unwrap();
+    }
+
+    /// A `transparent_spend_search_queue` row is a request to locate the spend of a single
+    /// outpoint, so a transaction with `k` unspent wallet outputs must yield `k` spend-search
+    /// requests rather than one per (queue row, unspent output) pair.
+    #[test]
+    #[cfg(not(feature = "spend-index"))]
+    fn spend_search_requests_are_generated_per_outpoint() {
+        /// The number of the test transaction's outputs that are received by the wallet.
+        const OUTPUT_COUNT: u32 = 3;
+        /// The value of each received output.
+        const OUTPUT_VALUE: Zatoshis = Zatoshis::const_from_u64(100_000);
+        /// The height of the test transaction, relative to the account birthday.
+        const MINED_HEIGHT_DELTA: u32 = 100;
+        /// The number of confirmations the test transaction has at the chain tip.
+        const CONFIRMATIONS: u32 = 10;
+
+        let mut st = TestBuilder::new()
+            .with_data_store_factory(TestDbFactory::default())
+            .with_account_from_sapling_activation(BlockHash([0; 32]))
+            .build();
+
+        let account = st.test_account().unwrap();
+        let account_id = account.id();
+        let mined_height = account.birthday().height() + MINED_HEIGHT_DELTA;
+        st.wallet_mut()
+            .update_chain_tip(mined_height + CONFIRMATIONS)
+            .unwrap();
+
+        // A single transaction pays `OUTPUT_COUNT` of the wallet's transparent addresses.
+        let recipients = st
+            .wallet()
+            .get_transparent_receivers(account_id, false, true)
+            .unwrap()
+            .into_keys()
+            .take(OUTPUT_COUNT as usize)
+            .collect::<Vec<_>>();
+        assert_eq!(recipients.len(), OUTPUT_COUNT as usize);
+
+        let txid = *OutPoint::fake().hash();
+        st.wallet_mut()
+            .db_mut()
+            .transactionally(|wdb| {
+                for (output_index, recipient) in recipients.iter().enumerate() {
+                    // The index of an output within a transaction's `vout` fits in a `u32`;
+                    // `OUTPUT_COUNT` bounds it here in any case.
+                    let output_index = u32::try_from(output_index).unwrap();
+                    let utxo = WalletTransparentOutput::from_parts(
+                        OutPoint::new(txid, output_index),
+                        TxOut::new(OUTPUT_VALUE, recipient.script().into()),
+                        Some(mined_height),
+                        Some(account_id),
+                        Some(TransparentKeyScope::EXTERNAL),
+                        None,
+                    )
+                    .expect("the output is a valid transparent output");
+
+                    super::put_transparent_output(
+                        wdb.conn.0,
+                        &wdb.params,
+                        &wdb.gap_limits,
+                        &utxo,
+                        mined_height,
+                        // The output is recorded as seen in a scanned block, not as the result
+                        // of a UTXO-set query, so no observed-unspent height is recorded for it.
+                        false,
+                    )?;
+
+                    let tx_ref = wdb.conn.0.query_row(
+                        "SELECT id_tx FROM transactions WHERE txid = :txid",
+                        named_params! { ":txid": &txid[..] },
+                        |row| row.get(0).map(TxRef),
+                    )?;
+
+                    super::queue_transparent_spend_detection(
+                        wdb.conn.0,
+                        &wdb.params,
+                        *recipient,
+                        tx_ref,
+                        output_index,
+                    )?;
+                }
+
+                Ok::<_, SqliteClientError>(())
+            })
+            .unwrap();
+
+        let requests = st.wallet().transaction_data_requests().unwrap();
+        for recipient in &recipients {
+            let request_count = requests
+                .iter()
+                .filter(|request| match request {
+                    TransactionDataRequest::TransactionsInvolvingAddress(r) => {
+                        r.address() == *recipient
+                    }
+                    _ => false,
+                })
+                .count();
+
+            assert_eq!(
+                request_count, 1,
+                "expected exactly one spend-search request for {recipient:?}"
+            );
+        }
     }
 
     /// Importing a standalone (`Foreign`) receiver whose address is already present as a derived
